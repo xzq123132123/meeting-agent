@@ -258,7 +258,325 @@ def merge_meetings(blocks: list) -> dict:
     }
 
 
-# ---- 侧边栏：配置 ----
+def call_meeting_llm(content: str, cfg: dict):
+    """调用 LLM 生成纪要（支持分块）。"""
+    chunks = parser.split_chunks(content, max_chars=8000)
+    results = []
+    with st.status("智能分析中…", expanded=True) as status:
+        for i, chunk in enumerate(chunks, 1):
+            st.write(f"▸ 正在处理第 {i}/{len(chunks)} 段（{len(chunk)} 字）")
+            data = llm.chat_json(
+                messages=[
+                    {"role": "system", "content": prompts.MEETING_SYSTEM},
+                    {"role": "user", "content": prompts.MEETING_USER_TEMPLATE.format(content=chunk)},
+                ],
+                base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
+            )
+            results.append(data)
+        status.update(label="分析完成", state="complete")
+    return merge_meetings(results) if results else None
+
+
+def call_weekly_llm(meetings: list, cfg: dict):
+    """调用 LLM 生成周报润色内容。"""
+    data = report.serialize_meetings(meetings)
+    return llm.chat_json(
+        messages=[
+            {"role": "system", "content": prompts.WEEKLY_SYSTEM},
+            {"role": "user", "content": prompts.WEEKLY_USER_TEMPLATE.format(data=data)},
+        ],
+        base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
+    )
+
+
+def render_meeting_card(idx: int, m: dict):
+    """渲染单份纪要卡片。"""
+    st.markdown(
+        f'<div class="topic-card fade-up"><div class="topic-title">📄 {m.get("title", "会议纪要")}'
+        f'<span style="color:#6E84A3;font-weight:400;font-size:12px;margin-left:10px;">'
+        f'{m.get("duration", "")} · 参与人：{", ".join(m.get("participants", []) or ["-"])}</span>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(f'<div class="summary-text">{m.get("summary", "")}</div>', unsafe_allow_html=True)
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown('<div class="section-title">议题讨论</div>', unsafe_allow_html=True)
+        for tp in m.get("topics", []) or []:
+            points = "".join(
+                f'<div class="topic-point">{p}</div>' for p in tp.get("points", []) or []
+            )
+            conclusion = (
+                f'<div class="topic-conclusion">{tp.get("conclusion", "")}</div>'
+                if tp.get("conclusion") else ""
+            )
+            st.markdown(
+                f'<div class="topic-card"><div class="topic-title">{tp.get("title", "")}</div>'
+                f'{points}{conclusion}</div>',
+                unsafe_allow_html=True,
+            )
+    with c2:
+        st.markdown('<div class="section-title">待办事项</div>', unsafe_allow_html=True)
+        todos = m.get("todos", []) or []
+        if todos:
+            rows = []
+            for t in todos:
+                p = str(t.get("priority", "中"))
+                dot = {"高": "🔴", "中": "🟡", "低": "🟢"}.get(p, "⚪")
+                rows.append({
+                    "优先级": f"{dot} {p}",
+                    "任务": t.get("task", ""),
+                    "负责人": t.get("owner", "待确认"),
+                    "截止": t.get("deadline", "未定"),
+                })
+            st.dataframe(
+                pd.DataFrame(rows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "优先级": st.column_config.TextColumn(width="small"),
+                    "任务": st.column_config.TextColumn(width="large"),
+                },
+            )
+        else:
+            st.markdown('<div style="color:#6E84A3;font-size:13px;">暂无待办任务</div>',
+                        unsafe_allow_html=True)
+
+        risks = m.get("risks", []) or []
+        if risks:
+            st.markdown('<div class="section-title" style="margin-top:14px;">风险提醒</div>',
+                        unsafe_allow_html=True)
+            st.markdown(
+                "".join(f'<div class="risk-item">{r}</div>' for r in risks),
+                unsafe_allow_html=True,
+            )
+
+    st.download_button(
+        f"下载纪要 {idx + 1}（Word）",
+        data=export.export_meeting_docx(m),
+        file_name=f"会议纪要_{datetime.date.today()}_{idx + 1}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        key=f"dl_meeting_{idx}",
+    )
+
+
+def render_weekly_section(cfg: dict):
+    """周报生成与展示。"""
+    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title" style="font-size:17px;">📈 一键生成周报</div>',
+                unsafe_allow_html=True)
+
+    meetings = st.session_state.meetings
+    if not meetings:
+        st.info("还没有纪要数据，请先在上方完成一次分析。")
+        return
+
+    col_gen, col_info = st.columns([1, 3])
+    with col_gen:
+        gen = st.button("生成周报", type="primary", use_container_width=True)
+    with col_info:
+        st.markdown(
+            f'<div style="color:#8AA0BC;font-size:13px;padding-top:8px;">'
+            f'基于当前 {len(meetings)} 份纪要自动汇总统计</div>',
+            unsafe_allow_html=True,
+        )
+
+    if gen:
+        agg = report.aggregate(meetings)
+        try:
+            if cfg.get("use_sample"):
+                weekly = SAMPLE_WEEKLY_RESULT
+            else:
+                weekly = call_weekly_llm(meetings, cfg)
+        except Exception as e:
+            st.warning(f"周报润色调用失败，已使用模板生成：{e}")
+            weekly = {}
+        text = report.build_weekly_text(
+            agg,
+            week_summary=weekly.get("week_summary"),
+            highlights=weekly.get("highlights"),
+            blockers=weekly.get("blockers"),
+            next_plan=weekly.get("next_plan"),
+        )
+        st.session_state.weekly_text = text
+        st.session_state.weekly_meta = {"agg": agg, "weekly": weekly}
+
+    if st.session_state.weekly_text:
+        agg = st.session_state.weekly_meta["agg"]
+        weekly = st.session_state.weekly_meta["weekly"]
+
+        # 指标卡
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.markdown(f'<div class="metric-card"><div class="metric-num">{agg["meeting_count"]}</div>'
+                        f'<div class="metric-label">本周会议/讨论</div></div>', unsafe_allow_html=True)
+        with m2:
+            st.markdown(f'<div class="metric-card"><div class="metric-num">{len(agg["topics"])}</div>'
+                        f'<div class="metric-label">讨论议题</div></div>', unsafe_allow_html=True)
+        with m3:
+            st.markdown(f'<div class="metric-card"><div class="metric-num">{len(agg["todos"])}</div>'
+                        f'<div class="metric-label">待办任务</div></div>', unsafe_allow_html=True)
+        with m4:
+            high_cnt = sum(1 for t in agg["todos"] if t.get("priority") == "高")
+            st.markdown(f'<div class="metric-card"><div class="metric-num">{high_cnt}</div>'
+                        f'<div class="metric-label">高优先级</div></div>', unsafe_allow_html=True)
+
+        # 图表
+        g1, g2 = st.columns(2)
+        with g1:
+            if not agg["owner_df"].empty:
+                fig1 = px.bar(
+                    agg["owner_df"], x="负责人", y="任务数",
+                    color="负责人", color_discrete_sequence=px.colors.sequential.Blues_r,
+                    title="待办任务 · 按负责人分布",
+                )
+                fig1.update_layout(
+                    template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#C7D6EA"),
+                    showlegend=False, margin=dict(l=20, r=20, t=48, b=20),
+                )
+                fig1.update_traces(marker_line_width=0)
+                st.plotly_chart(fig1, use_container_width=True, config={"displayModeBar": False})
+        with g2:
+            if not agg["priority_df"].empty:
+                fig2 = px.pie(
+                    agg["priority_df"], names="优先级", values="数量",
+                    color="优先级",
+                    color_discrete_map={"高": "#F26D6D", "中": "#E8C05A", "低": "#6FE3C1"},
+                    title="待办任务 · 优先级占比",
+                )
+                fig2.update_layout(
+                    template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#C7D6EA"), showlegend=True,
+                    legend=dict(orientation="h", y=-0.15),
+                    margin=dict(l=20, r=20, t=48, b=20),
+                )
+                st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+
+        # 周报正文
+        st.markdown('<div class="section-title">周报正文</div>', unsafe_allow_html=True)
+        blocks = st.session_state.weekly_text.split("\n")
+        html_parts = []
+        for line in blocks:
+            if line.startswith("【") and line.endswith("】"):
+                html_parts.append(f'<div class="section-title" style="margin-top:10px;">{line}</div>')
+            elif line.strip():
+                html_parts.append(f'<div style="color:#C7D6EA;font-size:13.5px;line-height:1.7;margin:2px 0;">{line}</div>')
+        st.markdown("".join(html_parts), unsafe_allow_html=True)
+
+        st.download_button(
+            "下载周报（Word）",
+            data=export.export_weekly_docx(st.session_state.weekly_text, agg),
+            file_name=f"团队周报_{datetime.date.today()}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key="dl_weekly",
+        )
+
+
+def sample_qa_reply(question: str) -> str:
+    """示例模式：按关键词匹配预置回复。"""
+    q = question.lower()
+    if any(k in q for k in ["英文", "english", "翻译", "translate"]):
+        return SAMPLE_QA_REPLIES["英文纪要"]
+    if any(k in q for k in ["ppt", "大纲", "slide", "slides"]):
+        return SAMPLE_QA_REPLIES["PPT 大纲"]
+    if any(k in q for k in ["邮件", "汇报", "email", "mail", "写一封"]):
+        return SAMPLE_QA_REPLIES["汇报邮件"]
+    if any(k in q for k in ["高优先", "高优", "待办", "任务", "todo"]):
+        return SAMPLE_QA_REPLIES["高优待办"]
+    if any(k in q for k in ["总结", "摘要", "一句话"]):
+        return SAMPLE_QA_REPLIES["一句话总结"]
+    return ("示例模式支持这些指令：**英文纪要 / PPT 大纲 / 汇报邮件 / 高优待办 / 一句话总结**。\n\n"
+            "自由提问请在真实模式（侧边栏配置 API Key 并关闭示例模式）下使用。")
+
+
+def render_qa_section(cfg: dict):
+    """智能问答 + 多形态输出（英文纪要 / PPT 大纲 / 汇报邮件等）。"""
+    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title" style="font-size:17px;">🤖 智能问答 · 多形态输出</div>',
+                unsafe_allow_html=True)
+
+    meetings = st.session_state.meetings
+    if not meetings:
+        st.info("先完成一次分析，即可对纪要提问。")
+        return
+
+    # 快捷指令
+    shortcut_question = None
+    labels = list(prompts.QA_SHORTCUTS.keys())
+    cols = st.columns(len(labels))
+    for col, label in zip(cols, labels):
+        with col:
+            if st.button(label, use_container_width=True, key=f"qa_btn_{label}"):
+                shortcut_question = prompts.QA_SHORTCUTS[label]
+
+    # 对话历史
+    for msg in st.session_state.qa_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_q = st.chat_input("对纪要提问，如：列出所有高优先级任务 / 翻译成英文 / 生成 PPT 大纲")
+    question = shortcut_question or user_q
+
+    if question:
+        st.session_state.qa_history.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            placeholder.markdown("_思考中…_")
+            try:
+                if cfg["use_sample"]:
+                    reply = sample_qa_reply(question)
+                elif not llm.is_configured(cfg["base_url"], cfg["api_key"], cfg["model"]):
+                    reply = "请先在侧边栏填写 API 配置（或开启示例模式）。"
+                else:
+                    context = report.serialize_meetings(meetings)
+                    if len(context) > 20000:
+                        context = context[:20000] + "\n…（内容过长已截断）"
+                    messages = [{"role": "system", "content": prompts.QA_SYSTEM}]
+                    if len(st.session_state.qa_history) <= 1:
+                        messages.append({
+                            "role": "user",
+                            "content": prompts.QA_CONTEXT_TEMPLATE.format(
+                                data=context, question=question
+                            ),
+                        })
+                    else:
+                        # 多轮：携带最近历史（首轮已含纪要上下文）
+                        messages.extend(st.session_state.qa_history[-6:])
+                    reply = llm.chat_text(messages, cfg["base_url"], cfg["api_key"], cfg["model"])
+            except llm.LLMError as e:
+                reply = f"⚠️ {e}"
+            except Exception as e:
+                reply = f"⚠️ 发生错误：{e}"
+
+            placeholder.markdown(reply)
+        st.session_state.qa_history.append({"role": "assistant", "content": reply})
+
+        # 仅保留最近 10 条，控制上下文长度
+        if len(st.session_state.qa_history) > 10:
+            st.session_state.qa_history = st.session_state.qa_history[-10:]
+
+    if st.session_state.qa_history:
+        export_text = "\n\n".join(
+            f"【{'用户' if m['role'] == 'user' else '助手'}】\n{m['content']}"
+            for m in st.session_state.qa_history
+        )
+        st.download_button(
+            "导出对话记录（txt）",
+            data=export_text.encode("utf-8"),
+            file_name=f"智能问答记录_{datetime.date.today()}.txt",
+            mime="text/plain",
+            key="dl_qa",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 侧边栏：配置
+# ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### ⚙️ 智能体配置")
     use_sample = st.toggle(
